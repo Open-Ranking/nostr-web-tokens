@@ -100,7 +100,8 @@ A verifier MUST:
 2. Verify the Nostr event signature.
 3. Verify the event `kind` is `27519`.
 4. Enforce `exp`, `nbf`, and `aud` claims when present; apply default behaviors when absent.
-5. Validate `pubkey` and `iss` trust (application-defined).
+5. Enforce [request claims](#http-request-binding) (`u`, `method`, `payload`, `challenge`) when present.
+6. Validate `pubkey` and `iss` trust (application-defined).
 
 
 ## Transport Encoding
@@ -115,13 +116,68 @@ Authorization: Nostr <base64url-no-padding-token>
 ```
 
 
+## HTTP Request Binding
+
+A NWT MAY be bound to a single HTTP request, so that it cannot be used for any other request. This provides the same guarantees as [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md), and exists to help services migrate off of NIP-98.
+
+Request-bound NWTs are NOT RECOMMENDED. Every request requires a new user signature, which can significantly slow down applications making many requests (e.g. hundreds of requests taking a second each to sign). Services SHOULD instead accept NWTs scoped with `aud`, `exp` and custom claims that authenticate the user for a whole session (see [Session Authentication](EXAMPLES.md#session-authentication-with-cookies)).
+
+### Request Claims
+
+| Claim     |   Tag  |   Status   | Type |     Cardinality     |
+|-----------|--------|------------|------ | --------------------|
+| URL | `u` | Optional | string | single |
+| Method | `method` | Optional | string | single |
+| Payload Hash | `payload` | Optional | hex-encoded sha256 | single |
+| Challenge | `challenge` | Optional | string | single |
+
+A NWT containing both `u` and `method` is a **request-bound** NWT.
+
+#### URL `u`
+
+The `u` (URL) claim identifies the absolute URL of the request, including query parameters.  
+If present, a verifier MUST reject the NWT if it doesn't exactly match the request URL. Since `u` already identifies the recipient, `aud` MAY be omitted from request-bound NWTs.
+
+#### Method `method`
+
+The `method` claim identifies the HTTP method of the request (e.g. `GET`, `POST`), in uppercase.  
+If present, a verifier MUST reject the NWT if it doesn't match the request method.
+
+#### Payload Hash `payload`
+
+The `payload` claim is the lowercase hex-encoded SHA-256 hash of the request body.  
+If present, a verifier MUST reject the NWT if it doesn't match the hash of the request body. Clients SHOULD include it for requests with a body, and verifiers MAY require it.
+
+#### Challenge `challenge`
+
+The `challenge` claim contains a nonce previously issued by the verifier (see [Challenge-Response](#challenge-response)).  
+If present, a verifier MUST reject the NWT if the challenge was not issued by itself, has expired, or has already been used.
+
+### Freshness
+
+Request-bound NWTs MUST include an `exp` claim, and it SHOULD be no more than 60 seconds after `iat`. Verifiers MAY reject request-bound NWTs whose validity window exceeds their own policy.
+
+### Challenge-Response
+
+To guarantee a NWT is used only once, a server MAY require a challenge. Like request binding, this requires a new user signature for every request and is NOT RECOMMENDED for general use. It is, however, well suited to [session login](EXAMPLES.md#session-authentication-with-cookies), which only requires one signature per session.
+
+1. The server responds to an unauthenticated request with `401 Unauthorized` and a `WWW-Authenticate` header containing a challenge:
+   ```
+   WWW-Authenticate: Nostr challenge="<nonce>"
+   ```
+2. The client signs a NWT with the `challenge` claim set to the nonce, and retries the request.
+3. The server validates the NWT and marks the challenge as used.
+
+Challenges MUST be unpredictable (e.g. at least 16 random bytes) and SHOULD expire shortly after being issued. A server MUST invalidate a challenge after its first successful use.
+
+
 ## HTTP Error Codes
 
 Servers responding to requests authenticated with a NWT SHOULD use the following HTTP status codes:
 
 | Code | Meaning | When to use |
 |------|---------|-------------|
-| `401 Unauthorized` | Missing or invalid token | The `Authorization` header is absent, the token is malformed, the signature is invalid, or the token is expired |
+| `401 Unauthorized` | Missing or invalid token | The `Authorization` header is absent, the token is malformed, the signature is invalid, the token is expired, a [request claim](#http-request-binding) doesn't match the request, or the challenge is invalid |
 | `403 Forbidden` | Insufficient permissions | The token is valid but does not grant access to the requested resource (e.g. wrong audience, missing claim) |
 
 
@@ -134,6 +190,7 @@ Because of that, it is recommended to:
 * Use short expiration times (e.g. 5 minutes)
 * Restrict the audience for destructive operations to avoid [replay attacks](https://en.wikipedia.org/wiki/Replay_attack)
 * Use the NWT event `id` if replay detection if needed
+* When storing a NWT in a cookie, use the `HttpOnly`, `Secure` and `SameSite` attributes and protect against CSRF (see [Session Authentication](EXAMPLES.md#session-authentication-with-cookies))
 
 ## Libraries
 
@@ -166,11 +223,30 @@ Example event:
 }
 ```
 
-In NWT terms, a NIP-98 event allows for a single URL path as the audience. This requires a signing round for every http request, which can become cumbersome in multi-server scenarios (e.g. blossom).
+NWT is a superset of NIP-98: a [request-bound](#http-request-binding) NWT uses the same `u`, `method` and `payload` tags, so the event above becomes a NWT by changing its kind to `27519` and adding an `exp` claim. This gives NIP-98 services a direct migration path, after which they SHOULD move to session-scoped NWTs:
 
-Secondly, NIP-98 relies on server-side freshness checks rather than user-defined validity time-windows.
+```json
+{
+    "id": <32-bytes hex-encoded sha256>,
+    "pubkey": <32-bytes hex-encoded public key>,
+    "created_at": <unix timestamp in seconds>,
+    "kind": 27519,
+    "tags": [
+        ["u", "https://api.snort.social/api/v1/n5sp/list"],
+        ["method", "GET"],
+        ["exp", "1710000060"]
+    ],
+    "content": "",
+    "sig": <64-bytes hex-encoded signature>
+}
+```
 
-Thirdly, NIP-98 doesn't allow for flexibility for app developers to add custom claims.
+Beyond that, NWT improves on NIP-98 in several ways:
+
+* NIP-98 requires a signing round for every http request, which can become cumbersome in multi-server scenarios (e.g. blossom). A NWT can instead target many servers with `aud`.
+* NIP-98 relies on server-side freshness checks (`created_at` within a fixed window) rather than user-defined validity time-windows (`exp`, `nbf`).
+* NIP-98 has no protection against replay within its freshness window. NWT supports single-use tokens via [challenge-response](#challenge-response).
+* NIP-98 doesn't allow app developers to add custom claims.
 
 
 ### NWT vs Blossom Auth
